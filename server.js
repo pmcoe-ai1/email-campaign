@@ -1,3 +1,4 @@
+// v38 - deployed via GitHub pipeline
 require('dotenv').config();
 const express = require('express');
 const sgMail = require('@sendgrid/mail');
