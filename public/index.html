@@ -656,7 +656,7 @@ function parseIntroMarkdown(md,style){
         else if(badgeText.toLowerCase().includes('earn')||badgeText.includes('$'))badgeClass='earn';
         else if(badgeText.toLowerCase().includes('discount')||badgeText.toLowerCase().includes('off'))badgeClass='discount';
       }
-      html+='<div class="benefit"><div><span class="benefit-title">'+title+'</span>'+(badgeText?'<span class="benefit-badge '+badgeClass+'">'+badgeText+'</span>':'')+(desc?'<div class="benefit-desc">'+desc+'</div>':'')+'</div></div>';
+      html+='<div class="benefit"><span class="benefit-title">'+title+'</span>'+(badgeText?'<span class="benefit-badge '+badgeClass+'">'+badgeText+'</span>':'')+(desc?'<div class="benefit-desc">'+desc+'</div>':'')+'</div>';
     }else if(!line.startsWith('#')){
       html+='<div class="price-caption">'+line+'</div>';
     }
