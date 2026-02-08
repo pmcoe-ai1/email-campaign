@@ -1,4 +1,4 @@
-// v38 - deployed via GitHub pipeline
+// v39 - Lead capture & nurture engine
 require('dotenv').config();
 const express = require('express');
 const sgMail = require('@sendgrid/mail');
@@ -46,6 +46,50 @@ async function initDatabase() {
   await pool.query(`CREATE TABLE IF NOT EXISTS survey_responses (id VARCHAR(50) PRIMARY KEY, survey_id VARCHAR(50) NOT NULL, campaign_id VARCHAR(50), contact_id VARCHAR(50), email VARCHAR(255), first_name VARCHAR(255), last_name VARCHAR(255), submitted_at TIMESTAMP DEFAULT NOW())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS survey_answers (id SERIAL PRIMARY KEY, response_id VARCHAR(50) NOT NULL, question_id INTEGER NOT NULL, answer_value TEXT)`);
   
+  // Lead capture tables
+  await pool.query(`CREATE TABLE IF NOT EXISTS leads (
+    id VARCHAR(50) PRIMARY KEY, email VARCHAR(255) NOT NULL, first_name VARCHAR(255), last_name VARCHAR(255),
+    course VARCHAR(50), region VARCHAR(100), promo_code VARCHAR(50), enrollment_url TEXT,
+    score INTEGER DEFAULT 0, status VARCHAR(30) DEFAULT 'new', gmail_message_id VARCHAR(100),
+    hubspot_contact_id VARCHAR(50), captured_at TIMESTAMP DEFAULT NOW(), converted_at TIMESTAMP,
+    UNIQUE(email, course)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lead_sequences (
+    id SERIAL PRIMARY KEY, lead_id VARCHAR(50) NOT NULL REFERENCES leads(id),
+    step INTEGER NOT NULL, subject VARCHAR(500), body TEXT,
+    scheduled_for TIMESTAMP NOT NULL, sent_at TIMESTAMP, status VARCHAR(30) DEFAULT 'pending',
+    sendgrid_message_id VARCHAR(100), opened BOOLEAN DEFAULT FALSE, clicked BOOLEAN DEFAULT FALSE
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lead_sequence_configs (
+    id SERIAL PRIMARY KEY, course VARCHAR(50) NOT NULL, step INTEGER NOT NULL,
+    delay_days INTEGER NOT NULL, subject VARCHAR(500) NOT NULL, body TEXT NOT NULL,
+    enabled BOOLEAN DEFAULT TRUE, UNIQUE(course, step)
+  )`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lead_processed_emails (
+    message_id VARCHAR(100) PRIMARY KEY, processed_at TIMESTAMP DEFAULT NOW()
+  )`);
+  
+  // Seed default nurture sequences if empty
+  const seqCount = await pool.query('SELECT COUNT(*) FROM lead_sequence_configs');
+  if (parseInt(seqCount.rows[0].count) === 0) {
+    const courses = ['PMP', 'CAPM', 'PMI-CP'];
+    for (const course of courses) {
+      const sequences = [
+        { step: 1, delay: 2, subject: `Your ${course} Certification Journey Starts Here`, body: `<p>Hi [First Name],</p><p>Thank you for your interest in ${course} certification! We wanted to share what our recent graduates are saying:</p><p><em>"PM CoE's ${course} training was exactly what I needed. The instructors were knowledgeable and the materials were comprehensive."</em></p><p>Ready to take the next step? Your discount code is still active.</p><p><a href="[Enrollment URL]" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Enroll Now with Your Discount</a></p><p>PM CoE Team</p>` },
+        { step: 2, delay: 5, subject: `Your ${course} discount expires soon!`, body: `<p>Hi [First Name],</p><p>Just a quick reminder — your ${course} promotion code <strong>[Promo Code]</strong> is valid for 14 days from when you received it.</p><p>Don't miss out on this discounted rate for our comprehensive ${course} certification training.</p><p><a href="[Enrollment URL]" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Use Your Discount Now</a></p><p>PM CoE Team</p>` },
+        { step: 3, delay: 9, subject: `Everything you need to know about ${course} certification`, body: `<p>Hi [First Name],</p><p>Did you know?</p><ul><li>${course === 'PMP' ? 'PMP-certified professionals earn 25% more on average than non-certified peers' : course === 'CAPM' ? 'CAPM certification is the perfect first step into project management' : 'PMI-CP certification demonstrates your expertise in construction project management'}</li><li>Our courses are ${course === 'PMP' || course === 'CAPM' ? 'G.I. Bill approved' : 'PMI Authorized Training Partner certified'}</li><li>We offer live instructor-led training across the US, Canada, and Australia</li></ul><p><a href="[Enrollment URL]" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Learn More & Enroll</a></p><p>PM CoE Team</p>` },
+        { step: 4, delay: 14, subject: `Last chance: Your ${course} discount is expiring`, body: `<p>Hi [First Name],</p><p>This is a final reminder that your ${course} promotion code <strong>[Promo Code]</strong> is about to expire.</p><p>If you have any questions about the course, schedule, or pricing, just reply to this email — we're here to help.</p><p><a href="[Enrollment URL]" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Enroll Before It Expires</a></p><p>PM CoE Team</p>` }
+      ];
+      for (const seq of sequences) {
+        await pool.query('INSERT INTO lead_sequence_configs (course, step, delay_days, subject, body) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING', [course, seq.step, seq.delay, seq.subject, seq.body]);
+      }
+    }
+  }
+  
+  // Load processed lead email IDs into memory
+  const leadMsgResult = await pool.query('SELECT message_id FROM lead_processed_emails');
+  leadMsgResult.rows.forEach(r => leadProcessedIds.add(r.message_id));
+  
   const tplCount = await pool.query('SELECT COUNT(*) FROM templates');
   if (parseInt(tplCount.rows[0].count) === 0) {
     const defaultTemplates = [
@@ -91,8 +135,10 @@ try { if (process.env.GOOGLE_CLIENT_ID) { oauth2Client = new google.auth.OAuth2(
 
 let gmailTokens = null;
 const processedMessageIds = new Set();
+const leadProcessedIds = new Set();
 function generateTrackingId() { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
 function generateId() { return crypto.randomBytes(8).toString('hex'); }
+function getAppUrl() { return process.env.APP_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN : 'http://localhost:' + (process.env.PORT || 3000)); }
 const DEFAULT_IMPORT_PROMPT = `Extract contacts as JSON array: [{"firstName":"","lastName":"","email":"","company":"","valid":true}]. If no email, set valid:false. Return ONLY JSON.`;
 
 // Auth
@@ -100,8 +146,7 @@ app.get('/api/auth/google', (req, res) => { if (!oauth2Client) return res.status
 app.get('/api/auth/google/callback', async (req, res) => { 
   try { 
     const { tokens } = await oauth2Client.getToken(req.query.code); 
-    console.log('OAuth callback - tokens received:', JSON.stringify(tokens, null, 2));
-    console.log('Has refresh_token:', !!tokens.refresh_token);
+    console.log('OAuth callback - tokens received (refresh_token:', !!tokens.refresh_token, ')');
     gmailTokens = tokens; 
     oauth2Client.setCredentials(tokens); 
     if (pool) await pool.query('INSERT INTO gmail_tokens (id, tokens, updated_at) VALUES (1, $1, NOW()) ON CONFLICT (id) DO UPDATE SET tokens = $1, updated_at = NOW()', [JSON.stringify(tokens)]); 
@@ -157,7 +202,8 @@ app.get('/survey/:id', async (req, res) => {
 });
 
 function generateSurveyHTML(survey, questions, params) {
-  const email = params.email || '', fname = params.fname || '', lname = params.lname || '', campaignId = params.campaign_id || '';
+  function esc(s) { return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/</g,'\\x3C').replace(/>/g,'\\x3E').replace(/"/g,'\\x22'); }
+  const email = esc(params.email), fname = esc(params.fname), lname = esc(params.lname), campaignId = esc(params.campaign_id);
   const questionsJSON = JSON.stringify(questions.map(q => ({ id: q.id, text: q.question_text, type: q.question_type, options: q.options || [], required: q.required, showStats: q.show_stats, conditional: q.conditional_logic, stripeLink: q.stripe_link, introContent: q.intro_content, introStyle: q.intro_style || 'modern' })));
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>${survey.name} | PM CoE</title><link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Poppins',sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px;color:#333}.logo{margin-bottom:30px}.logo img{height:60px}.container{background:#fff;border-radius:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,0.4);max-width:600px;width:100%;overflow:hidden}.header{background:linear-gradient(135deg,#e94560 0%,#c73e54 100%);padding:30px 40px;color:white}.header h1{font-size:1.6rem;font-weight:600;margin-bottom:8px}.header p{font-size:0.95rem;opacity:0.9}.body{padding:35px 40px}.progress{height:4px;background:#e9ecef;border-radius:2px;margin-bottom:25px;overflow:hidden}.progress-fill{height:100%;background:linear-gradient(135deg,#e94560 0%,#c73e54 100%);transition:width 0.4s ease}.question{display:none;animation:fadeIn 0.4s ease}.question.active{display:block}@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}.question-label{font-size:1.05rem;font-weight:500;color:#1a1a2e;margin-bottom:18px;display:block}.options{display:flex;flex-direction:column;gap:12px}.option{position:relative}.option input{position:absolute;opacity:0}.option label{display:block;padding:16px 20px;background:#f8f9fa;border:2px solid #e9ecef;border-radius:10px;cursor:pointer;transition:all 0.2s;font-size:0.95rem;color:#495057}.option label:hover{border-color:#e94560;background:#fff5f7}.option input:checked+label{border-color:#e94560;background:#fff5f7;color:#c73e54;font-weight:500}textarea{width:100%;padding:14px 18px;border:2px solid #e9ecef;border-radius:10px;font-family:inherit;font-size:0.95rem;resize:vertical;min-height:100px}textarea:focus{outline:none;border-color:#e94560}.btn{display:inline-block;padding:14px 32px;background:linear-gradient(135deg,#e94560 0%,#c73e54 100%);color:white;border:none;border-radius:8px;font-family:inherit;font-size:1rem;font-weight:500;cursor:pointer;transition:all 0.2s;margin-top:20px}.btn:hover{transform:translateY(-2px);box-shadow:0 8px 20px rgba(233,69,96,0.3)}.btn-secondary{background:#6c757d;margin-right:10px}.btn-stripe{background:linear-gradient(135deg,#28a745 0%,#20c997 100%);padding:16px 40px;font-size:1.1rem}.btn-group{display:flex;gap:10px;margin-top:25px;flex-wrap:wrap}.success{text-align:center;padding:20px 0;display:none}.success.active{display:block;animation:fadeIn 0.4s ease}.success-icon{width:80px;height:80px;background:linear-gradient(135deg,#28a745 0%,#20c997 100%);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px}.success-icon svg{width:40px;height:40px;stroke:white;stroke-width:3}.success h2{color:#1a1a2e;font-size:1.4rem;margin-bottom:10px}.success p{color:#6c757d}.cta-link{display:inline-block;margin-top:20px;padding:12px 24px;background:#f8f9fa;border:2px solid #e94560;color:#e94560;border-radius:8px;text-decoration:none;font-weight:500}.cta-link:hover{background:#e94560;color:white}.stripe-box{text-align:center;padding:25px;background:#f8f9fa;border-radius:12px;margin-bottom:20px}.stripe-box h3{font-size:1.2rem;color:#1a1a2e;margin-bottom:12px}.stripe-box p{font-size:0.95rem;color:#495057;margin-bottom:20px}@media(max-width:600px){body{padding:20px 15px}.header,.body{padding:25px 20px}.btn{width:100%;text-align:center}.btn-group{flex-direction:column}.btn-secondary{margin-right:0;margin-bottom:10px}}
 .intro-modern{background:#f8f9fa;border-radius:0 12px 12px 0;padding:24px;margin-bottom:24px;border-left:4px solid #e94560}.intro-modern-header{text-align:center}.intro-modern h2{color:#1a1a2e;font-size:1.4rem;margin-bottom:8px}.intro-modern .subhead{color:#6c757d;margin-bottom:16px}.intro-modern .price{font-size:2.5rem;font-weight:700;color:#e94560;margin:16px 0 4px}.intro-modern .price-caption{color:#6c757d;font-size:0.9rem;margin-bottom:20px}.intro-modern .benefit{padding:12px 0;border-top:1px solid #e9ecef;text-align:left !important}.intro-modern .benefit:first-of-type{border-top:none}.intro-modern .benefit-title{font-weight:600;color:#1a1a2e;display:inline;text-align:left}.intro-modern .benefit-badge{font-size:0.7rem;padding:2px 8px;border-radius:10px;margin-left:8px;font-weight:600;vertical-align:middle}.intro-modern .benefit-badge.free{background:#d4edda;color:#155724}.intro-modern .benefit-badge.earn{background:#fff3cd;color:#856404}.intro-modern .benefit-badge.discount{background:#cce5ff;color:#004085}.intro-modern .benefit-desc{color:#6c757d;font-size:0.85rem;margin-top:4px;display:block;padding-left:0;margin-left:0;text-align:left !important}
@@ -239,7 +285,7 @@ app.post('/api/campaigns/:id/send', async (req, res) => {
       const finalBody = injectTracking(wrappedBody, campaign.tracking_id);
       try {
         await sgMail.send({ to: email, from: process.env.FROM_EMAIL || 'noreply@example.com', subject: campaign.subject, html: finalBody, trackingSettings: { clickTracking: { enable: true }, openTracking: { enable: true } }, customArgs: { campaignId: campaign.id, contactId: contact.id } });
-        recipient.sent = true; recipient.delivered = true; results.sent++;
+        recipient.sent = true; results.sent++;
         updateHubSpotContact(contact.id);
       } catch (e) { results.failed++; recipient.error = e.message; }
       recipients.push(recipient);
@@ -350,6 +396,314 @@ app.post('/api/replies/:id/respond', async (req, res) => { if (!sgInitialized ||
 app.post('/api/replies/:id/dismiss', async (req, res) => { if (!pool) return res.status(500).json({ error: 'Database not configured' }); try { await pool.query('UPDATE replies SET status = $1 WHERE id = $2', ['dismissed', req.params.id]); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.post('/api/replies/:id/link', async (req, res) => { if (!pool) return res.status(500).json({ error: 'Database not configured' }); try { await pool.query('UPDATE replies SET campaign_id = $1 WHERE id = $2', [req.body.campaignId, req.params.id]); res.json({ success: true }); } catch (e) { res.status(500).json({ error: e.message }); } });
 
+// ==================== LEAD CAPTURE ENGINE ====================
+
+function parsePromotionEmail(subject, body, toEmail) {
+  // Extract course from subject: "PMP promotion code claim", "CAPM promotion code claim", etc.
+  const courseMatch = subject.match(/^(PMP|CAPM|PMI-CP|PMI-ACP)\s+promotion\s+code\s+claim/i);
+  if (!courseMatch) return null;
+  const course = courseMatch[1].toUpperCase();
+  
+  // Extract name: "Hi Santiago Verguizas Sanchez," or "Hi Atulya Andotra,"
+  const nameMatch = body.match(/Hi\s+([^,]+),/i);
+  let firstName = '', lastName = '';
+  if (nameMatch) {
+    const parts = nameMatch[1].trim().split(/\s+/);
+    firstName = parts[0] || '';
+    lastName = parts.slice(1).join(' ') || '';
+  }
+  
+  // Extract promo code: "promotion code is SPECIAL60" or "promotion code is NFP"
+  const promoMatch = body.match(/promotion\s+code\s+(?:is\s+)?(\w+)/i);
+  const promoCode = promoMatch ? promoMatch[1] : '';
+  
+  // Extract enrollment URL
+  const urlMatch = body.match(/https?:\/\/www\.pm-coe\.com\/[^\s"<]+/i);
+  const enrollmentUrl = urlMatch ? urlMatch[0] : '';
+  
+  // Extract region from URL or body text
+  let region = 'Unknown';
+  if (enrollmentUrl.includes('_na') || body.toLowerCase().includes('north america')) region = 'North America';
+  else if (body.toLowerCase().includes('europe') || enrollmentUrl.includes('europe')) region = 'Europe';
+  else if (body.toLowerCase().includes('australia') || enrollmentUrl.includes('_au')) region = 'Australia';
+  
+  return { course, firstName, lastName, email: toEmail, promoCode, enrollmentUrl, region };
+}
+
+function scoreLead(lead) {
+  let score = 50; // Base score for downloading a discount code
+  // Course value
+  if (lead.course === 'PMP') score += 20;
+  else if (lead.course === 'PMI-CP') score += 15;
+  else if (lead.course === 'CAPM') score += 10;
+  // Corporate email (not gmail/yahoo/hotmail/outlook)
+  const freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com', 'live.com', 'mail.com', 'protonmail.com'];
+  const domain = lead.email.split('@')[1]?.toLowerCase();
+  if (domain && !freeProviders.includes(domain)) score += 20; // Corporate email
+  // Region
+  if (lead.region === 'North America') score += 5;
+  return Math.min(score, 100);
+}
+
+async function checkForLeads() {
+  if (!gmailTokens || !oauth2Client || !pool) return;
+  try {
+    oauth2Client.setCredentials(gmailTokens);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    // Search sent folder for promotion code claim emails
+    const list = await gmail.users.messages.list({ 
+      userId: 'me', 
+      q: 'in:sent subject:"promotion code claim"', 
+      maxResults: 20 
+    });
+    if (!list.data.messages) return;
+    
+    let newLeadsCount = 0;
+    for (const m of list.data.messages) {
+      if (leadProcessedIds.has(m.id)) continue;
+      
+      // Check DB too
+      const existing = await pool.query('SELECT message_id FROM lead_processed_emails WHERE message_id = $1', [m.id]);
+      if (existing.rows.length) { leadProcessedIds.add(m.id); continue; }
+      
+      const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
+      const headers = msg.data.payload.headers;
+      const subject = headers.find(h => h.name === 'Subject')?.value || '';
+      const to = headers.find(h => h.name === 'To')?.value || '';
+      
+      // Extract recipient email
+      const toMatch = to.match(/<(.+)>/) || to.match(/([^\s,]+@[^\s,]+)/);
+      const toEmail = toMatch ? toMatch[1] : to.trim();
+      
+      // Skip if sent to self
+      if (toEmail.toLowerCase().includes('alan.k@pm-coe.com')) {
+        leadProcessedIds.add(m.id);
+        await pool.query('INSERT INTO lead_processed_emails (message_id) VALUES ($1) ON CONFLICT DO NOTHING', [m.id]);
+        continue;
+      }
+      
+      // Extract body
+      let body = '';
+      if (msg.data.payload.body?.data) {
+        body = Buffer.from(msg.data.payload.body.data, 'base64').toString();
+      } else if (msg.data.payload.parts) {
+        let part = msg.data.payload.parts.find(x => x.mimeType === 'text/plain');
+        if (!part) part = msg.data.payload.parts.find(x => x.mimeType === 'text/html');
+        if (!part) {
+          for (const p of msg.data.payload.parts) {
+            if (p.parts) { part = p.parts.find(x => x.mimeType === 'text/plain') || p.parts.find(x => x.mimeType === 'text/html'); if (part) break; }
+          }
+        }
+        if (part?.body?.data) body = Buffer.from(part.body.data, 'base64').toString();
+      }
+      if (body.includes('<html') || body.includes('<div') || body.includes('<p>')) {
+        body = body.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      }
+      
+      const lead = parsePromotionEmail(subject, body, toEmail);
+      if (!lead) {
+        leadProcessedIds.add(m.id);
+        await pool.query('INSERT INTO lead_processed_emails (message_id) VALUES ($1) ON CONFLICT DO NOTHING', [m.id]);
+        continue;
+      }
+      
+      lead.score = scoreLead(lead);
+      const leadId = generateId();
+      
+      // Insert or update lead (same person might download multiple course codes)
+      try {
+        await pool.query(`INSERT INTO leads (id, email, first_name, last_name, course, region, promo_code, enrollment_url, score, gmail_message_id, captured_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+          ON CONFLICT (email, course) DO UPDATE SET promo_code = $7, enrollment_url = $8, score = GREATEST(leads.score, $9), captured_at = NOW()`,
+          [leadId, lead.email, lead.firstName, lead.lastName, lead.course, lead.region, lead.promoCode, lead.enrollmentUrl, lead.score, m.id]);
+      } catch (e) { console.error('Lead insert error:', e.message); }
+      
+      // Add to HubSpot
+      if (hubspotClient) {
+        try {
+          const sr = await hubspotClient.crm.contacts.searchApi.doSearch({
+            filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: lead.email }] }],
+            properties: ['customer_tag']
+          });
+          const tag = `lead-${lead.course.toLowerCase()}`;
+          if (sr.results.length) {
+            const ex = sr.results[0];
+            let tags = (ex.properties.customer_tag || '').split(',').map(t => t.trim()).filter(t => t);
+            if (!tags.includes(tag)) tags.push(tag);
+            if (!tags.includes('auto-captured')) tags.push('auto-captured');
+            await hubspotClient.crm.contacts.basicApi.update(ex.id, { properties: { customer_tag: tags.join(',') } });
+            await pool.query('UPDATE leads SET hubspot_contact_id = $1 WHERE email = $2 AND course = $3', [ex.id, lead.email, lead.course]);
+          } else {
+            const created = await hubspotClient.crm.contacts.basicApi.create({ properties: {
+              email: lead.email, firstname: lead.firstName, lastname: lead.lastName,
+              customer_tag: `${tag},auto-captured`
+            }});
+            await pool.query('UPDATE leads SET hubspot_contact_id = $1 WHERE email = $2 AND course = $3', [created.id, lead.email, lead.course]);
+          }
+        } catch (e) { console.error('HubSpot lead sync error:', e.message); }
+      }
+      
+      // Create nurture sequence
+      try {
+        // Get actual lead ID (might have been ON CONFLICT updated)
+        const leadRow = await pool.query('SELECT id FROM leads WHERE email = $1 AND course = $2', [lead.email, lead.course]);
+        const actualLeadId = leadRow.rows[0]?.id;
+        if (actualLeadId) {
+          // Check if sequence already exists
+          const existingSeq = await pool.query('SELECT id FROM lead_sequences WHERE lead_id = $1', [actualLeadId]);
+          if (existingSeq.rows.length === 0) {
+            const configs = await pool.query('SELECT * FROM lead_sequence_configs WHERE course = $1 AND enabled = TRUE ORDER BY step', [lead.course]);
+            for (const config of configs.rows) {
+              let emailSubject = config.subject.replace(/\[First Name\]/gi, lead.firstName);
+              let emailBody = config.body
+                .replace(/\[First Name\]/gi, lead.firstName)
+                .replace(/\[Promo Code\]/gi, lead.promoCode)
+                .replace(/\[Enrollment URL\]/gi, lead.enrollmentUrl);
+              const scheduledFor = new Date(Date.now() + config.delay_days * 24 * 60 * 60 * 1000);
+              await pool.query('INSERT INTO lead_sequences (lead_id, step, subject, body, scheduled_for) VALUES ($1, $2, $3, $4, $5)',
+                [actualLeadId, config.step, emailSubject, emailBody, scheduledFor]);
+            }
+          }
+        }
+      } catch (e) { console.error('Sequence creation error:', e.message); }
+      
+      leadProcessedIds.add(m.id);
+      await pool.query('INSERT INTO lead_processed_emails (message_id) VALUES ($1) ON CONFLICT DO NOTHING', [m.id]);
+      newLeadsCount++;
+      console.log(`Lead captured: ${lead.firstName} ${lead.lastName} <${lead.email}> - ${lead.course} (score: ${lead.score})`);
+    }
+    if (newLeadsCount > 0) console.log(`Lead scan complete: ${newLeadsCount} new leads captured`);
+  } catch (e) { console.error('Lead capture error:', e.message, e.stack); }
+}
+
+async function processLeadSequences() {
+  if (!pool || !sgInitialized) return;
+  try {
+    const due = await pool.query(`SELECT ls.*, l.email, l.first_name, l.enrollment_url, l.promo_code, l.course
+      FROM lead_sequences ls JOIN leads l ON ls.lead_id = l.id
+      WHERE ls.status = 'pending' AND ls.scheduled_for <= NOW() AND l.status != 'converted' AND l.status != 'unsubscribed'
+      ORDER BY ls.scheduled_for`);
+    
+    for (const seq of due.rows) {
+      try {
+        const wrappedBody = wrapEmailHTML(seq.body);
+        await sgMail.send({
+          to: seq.email,
+          from: process.env.FROM_EMAIL || 'noreply@example.com',
+          subject: seq.subject,
+          html: wrappedBody,
+          trackingSettings: { clickTracking: { enable: true }, openTracking: { enable: true } },
+          customArgs: { leadSequence: seq.id.toString() }
+        });
+        await pool.query('UPDATE lead_sequences SET status = $1, sent_at = NOW() WHERE id = $2', ['sent', seq.id]);
+        console.log(`Lead nurture sent: Step ${seq.step} to ${seq.email} (${seq.course})`);
+      } catch (e) {
+        await pool.query('UPDATE lead_sequences SET status = $1 WHERE id = $2', ['failed', seq.id]);
+        console.error(`Lead nurture failed: ${seq.email}`, e.message);
+      }
+    }
+  } catch (e) { console.error('Lead sequence processor error:', e.message); }
+}
+
+// ==================== LEAD API ENDPOINTS ====================
+
+// Get all leads with stats
+app.get('/api/leads', async (req, res) => {
+  if (!pool) return res.json([]);
+  try {
+    const result = await pool.query(`SELECT l.*, 
+      (SELECT COUNT(*) FROM lead_sequences ls WHERE ls.lead_id = l.id AND ls.status = 'sent') as emails_sent,
+      (SELECT COUNT(*) FROM lead_sequences ls WHERE ls.lead_id = l.id AND ls.opened = TRUE) as emails_opened,
+      (SELECT COUNT(*) FROM lead_sequences ls WHERE ls.lead_id = l.id AND ls.clicked = TRUE) as emails_clicked,
+      (SELECT MAX(ls.step) FROM lead_sequences ls WHERE ls.lead_id = l.id AND ls.status = 'sent') as last_step_sent,
+      (SELECT COUNT(*) FROM lead_sequences ls WHERE ls.lead_id = l.id AND ls.status = 'pending') as emails_pending
+      FROM leads l ORDER BY l.captured_at DESC`);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get lead stats summary
+app.get('/api/leads/stats', async (req, res) => {
+  if (!pool) return res.json({});
+  try {
+    const total = await pool.query('SELECT COUNT(*) FROM leads');
+    const byStatus = await pool.query('SELECT status, COUNT(*) FROM leads GROUP BY status');
+    const byCourse = await pool.query('SELECT course, COUNT(*) FROM leads GROUP BY course');
+    const thisWeek = await pool.query("SELECT COUNT(*) FROM leads WHERE captured_at >= NOW() - INTERVAL '7 days'");
+    const hotLeads = await pool.query('SELECT COUNT(*) FROM leads WHERE score >= 80');
+    const sequencesSent = await pool.query("SELECT COUNT(*) FROM lead_sequences WHERE status = 'sent'");
+    res.json({
+      total: parseInt(total.rows[0].count),
+      thisWeek: parseInt(thisWeek.rows[0].count),
+      hot: parseInt(hotLeads.rows[0].count),
+      sequencesSent: parseInt(sequencesSent.rows[0].count),
+      byStatus: Object.fromEntries(byStatus.rows.map(r => [r.status, parseInt(r.count)])),
+      byCourse: Object.fromEntries(byCourse.rows.map(r => [r.course, parseInt(r.count)]))
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get lead sequence details
+app.get('/api/leads/:id/sequence', async (req, res) => {
+  if (!pool) return res.json([]);
+  try {
+    const result = await pool.query('SELECT * FROM lead_sequences WHERE lead_id = $1 ORDER BY step', [req.params.id]);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update lead status
+app.put('/api/leads/:id/status', async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const { status } = req.body;
+    const updates = status === 'converted' ? 'status = $1, converted_at = NOW()' : 'status = $1';
+    await pool.query(`UPDATE leads SET ${updates} WHERE id = $2`, [status, req.params.id]);
+    if (status === 'unsubscribed') {
+      await pool.query("UPDATE lead_sequences SET status = 'cancelled' WHERE lead_id = $1 AND status = 'pending'", [req.params.id]);
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Manually trigger lead scan
+app.post('/api/leads/scan', async (req, res) => {
+  await checkForLeads();
+  res.json({ success: true });
+});
+
+// Get/update sequence configs
+app.get('/api/leads/sequences/config', async (req, res) => {
+  if (!pool) return res.json([]);
+  try {
+    const result = await pool.query('SELECT * FROM lead_sequence_configs ORDER BY course, step');
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/leads/sequences/config/:id', async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const { delay_days, subject, body, enabled } = req.body;
+    await pool.query('UPDATE lead_sequence_configs SET delay_days = $1, subject = $2, body = $3, enabled = $4 WHERE id = $5',
+      [delay_days, subject, body, enabled, req.params.id]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Add new course sequence config
+app.post('/api/leads/sequences/config', async (req, res) => {
+  if (!pool) return res.status(500).json({ error: 'Database not configured' });
+  try {
+    const { course, step, delay_days, subject, body } = req.body;
+    const result = await pool.query('INSERT INTO lead_sequence_configs (course, step, delay_days, subject, body) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [course, step, delay_days, subject, body]);
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ==================== END LEAD CAPTURE ====================
+
 // File parsing
 function parseExcel(buffer) { const workbook = XLSX.read(buffer, { type: 'buffer' }); const sheet = workbook.Sheets[workbook.SheetNames[0]]; return XLSX.utils.sheet_to_json(sheet, { header: 1 }); }
 function parseRowsToContacts(rows) { if (!rows || rows.length === 0) return []; const firstRow = rows[0]; const hasHeader = firstRow && firstRow.some(cell => { const c = String(cell || '').toLowerCase(); return c.includes('name') || c.includes('email') || c.includes('first') || c.includes('last') || c.includes('company'); }); let headers = null, dataRows = rows; if (hasHeader) { headers = firstRow.map(h => String(h || '').toLowerCase()); dataRows = rows.slice(1); } const contacts = []; for (const row of dataRows) { if (!row || row.length === 0 || row.every(c => !c)) continue; let firstName = '', lastName = '', email = '', company = '', phone = '', jobTitle = ''; if (headers) { const fi = headers.findIndex(h => h.includes('first')), li = headers.findIndex(h => h.includes('last')), ei = headers.findIndex(h => h.includes('email')), ci = headers.findIndex(h => h.includes('company') || h.includes('org')), pi = headers.findIndex(h => h.includes('phone')), ji = headers.findIndex(h => h.includes('title') || h.includes('job')); if (fi >= 0) firstName = String(row[fi] || '').trim(); if (li >= 0) lastName = String(row[li] || '').trim(); if (ei >= 0) email = String(row[ei] || '').trim(); if (ci >= 0) company = String(row[ci] || '').trim(); if (pi >= 0) phone = String(row[pi] || '').trim(); if (ji >= 0) jobTitle = String(row[ji] || '').trim(); if (!email) { for (const cell of row) { const s = String(cell || ''); if (s.includes('@') && s.includes('.')) { email = s.trim(); break; } } } } else { for (const cell of row) { const s = String(cell || '').trim(); if (!email && s.includes('@') && s.includes('.')) email = s; else if (!firstName && s && !s.includes('@')) firstName = s; else if (!lastName && s && !s.includes('@') && firstName) lastName = s; } } contacts.push({ firstName, lastName, email, company, phone, jobTitle, valid: email && email.includes('@') && email.includes('.') }); } return contacts; }
@@ -358,8 +712,10 @@ app.post('/api/import/extract', upload.single('file'), async (req, res) => { try
 app.post('/api/import/confirm', async (req, res) => { if (!hubspotClient) return res.status(500).json({ error: 'HubSpot not configured' }); try { const { contacts, tags } = req.body; if (pool && tags?.length) { for (const tag of tags) { try { await pool.query('INSERT INTO tags (name) VALUES ($1) ON CONFLICT DO NOTHING', [tag]); } catch (e) {} } } const results = { created: 0, updated: 0, skipped: 0 }; for (const c of contacts) { if (!c.email || !c.valid) { results.skipped++; continue; } try { const sr = await hubspotClient.crm.contacts.searchApi.doSearch({ filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: c.email }] }], properties: ['customer_tag'] }); const props = { email: c.email, firstname: c.firstName || '', lastname: c.lastName || '', company: c.company || '', phone: c.phone || '', jobtitle: c.jobTitle || '' }; if (sr.results.length) { const ex = sr.results[0]; let exTags = (ex.properties.customer_tag || '').split(',').map(t => t.trim()).filter(t => t); tags.forEach(t => { if (!exTags.includes(t)) exTags.push(t); }); props.customer_tag = exTags.join(','); await hubspotClient.crm.contacts.basicApi.update(ex.id, { properties: props }); results.updated++; } else { props.customer_tag = tags.join(','); await hubspotClient.crm.contacts.basicApi.create({ properties: props }); results.created++; } } catch (e) { results.skipped++; } } res.json(results); } catch (e) { res.status(500).json({ error: e.message }); } });
 
 // Scheduled campaign processor
-setInterval(async () => { if (!pool || !hubspotClient || !sgInitialized) return; try { const result = await pool.query("SELECT * FROM campaigns WHERE status = 'scheduled' AND scheduled_time <= NOW()"); for (const campaign of result.rows) { const contactIds = campaign.contact_ids ? campaign.contact_ids.split(',').filter(x => x) : []; if (!contactIds.length) continue; const contacts = await hubspotClient.crm.contacts.batchApi.read({ inputs: contactIds.map(id => ({ id })), properties: ['firstname', 'lastname', 'email'] }); const recipients = []; const surveyBaseUrl = campaign.survey_id ? (process.env.APP_URL || 'http://localhost:3000') + '/survey/' + campaign.survey_id : null; for (const contact of contacts.results) { const email = contact.properties.email, firstName = contact.properties.firstname || '', lastName = contact.properties.lastname || ''; const recipient = { contactId: contact.id, name: (firstName + ' ' + lastName).trim(), email, sent: false, delivered: false, opened: false, clicked: false, bounced: false, error: null }; if (!email) { recipient.error = 'No email'; recipients.push(recipient); continue; } let emailBody = campaign.body.replace(/\[First Name\]/gi, firstName); if (surveyBaseUrl) { const surveyLink = surveyBaseUrl + '?email=' + encodeURIComponent(email) + '&fname=' + encodeURIComponent(firstName) + '&lname=' + encodeURIComponent(lastName) + '&campaign_id=' + campaign.id; emailBody = emailBody.replace(/\{\{survey_link\}\}/gi, surveyLink); emailBody = emailBody.replace(/\[Survey Link\]/gi, '<a href="' + surveyLink + '" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Take the Survey</a>'); } const wrappedBody = wrapEmailHTML(emailBody); const finalBody = injectTracking(wrappedBody, campaign.tracking_id); try { await sgMail.send({ to: email, from: process.env.FROM_EMAIL || 'noreply@example.com', subject: campaign.subject, html: finalBody, trackingSettings: { clickTracking: { enable: true }, openTracking: { enable: true } }, customArgs: { campaignId: campaign.id, contactId: contact.id } }); recipient.sent = true; recipient.delivered = true; updateHubSpotContact(contact.id); } catch (e) { recipient.error = e.message; } recipients.push(recipient); } await pool.query('UPDATE campaigns SET status = $1, sent_at = NOW(), recipients = $2 WHERE id = $3', ['sent', JSON.stringify(recipients), campaign.id]); } } catch (e) { console.error('Scheduler error:', e.message); } }, 60000);
+setInterval(async () => { if (!pool || !hubspotClient || !sgInitialized) return; try { const result = await pool.query("SELECT * FROM campaigns WHERE status = 'scheduled' AND scheduled_time <= NOW()"); for (const campaign of result.rows) { const contactIds = campaign.contact_ids ? campaign.contact_ids.split(',').filter(x => x) : []; if (!contactIds.length) continue; const contacts = await hubspotClient.crm.contacts.batchApi.read({ inputs: contactIds.map(id => ({ id })), properties: ['firstname', 'lastname', 'email'] }); const recipients = []; const surveyBaseUrl = campaign.survey_id ? getAppUrl() + '/survey/' + campaign.survey_id : null; for (const contact of contacts.results) { const email = contact.properties.email, firstName = contact.properties.firstname || '', lastName = contact.properties.lastname || ''; const recipient = { contactId: contact.id, name: (firstName + ' ' + lastName).trim(), email, sent: false, delivered: false, opened: false, clicked: false, bounced: false, error: null }; if (!email) { recipient.error = 'No email'; recipients.push(recipient); continue; } let emailBody = campaign.body.replace(/\[First Name\]/gi, firstName); if (surveyBaseUrl) { const surveyLink = surveyBaseUrl + '?email=' + encodeURIComponent(email) + '&fname=' + encodeURIComponent(firstName) + '&lname=' + encodeURIComponent(lastName) + '&campaign_id=' + campaign.id; emailBody = emailBody.replace(/\{\{survey_link\}\}/gi, surveyLink); emailBody = emailBody.replace(/\[Survey Link\]/gi, '<a href="' + surveyLink + '" style="display:inline-block;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:6px;font-weight:500">Take the Survey</a>'); } const wrappedBody = wrapEmailHTML(emailBody); const finalBody = injectTracking(wrappedBody, campaign.tracking_id); try { await sgMail.send({ to: email, from: process.env.FROM_EMAIL || 'noreply@example.com', subject: campaign.subject, html: finalBody, trackingSettings: { clickTracking: { enable: true }, openTracking: { enable: true } }, customArgs: { campaignId: campaign.id, contactId: contact.id } }); recipient.sent = true; updateHubSpotContact(contact.id); } catch (e) { recipient.error = e.message; } recipients.push(recipient); } await pool.query('UPDATE campaigns SET status = $1, sent_at = NOW(), recipients = $2 WHERE id = $3', ['sent', JSON.stringify(recipients), campaign.id]); } } catch (e) { console.error('Scheduler error:', e.message); } }, 60000);
 setInterval(checkForReplies, 300000);
+setInterval(checkForLeads, 300000); // Check for new leads every 5 minutes
+setInterval(processLeadSequences, 60000); // Process due nurture emails every minute
 
 const PORT = process.env.PORT || 3000;
 initDatabase().then(() => { app.listen(PORT, '0.0.0.0', () => { console.log('Server running on port ' + PORT); console.log('Database: ' + (pool ? 'connected' : 'not configured')); console.log('HubSpot: ' + (hubspotClient ? 'configured' : 'not configured')); console.log('SendGrid: ' + (sgInitialized ? 'configured' : 'not configured')); console.log('Anthropic: ' + (anthropic ? 'configured' : 'not configured')); console.log('Google OAuth: ' + (oauth2Client ? 'configured' : 'not configured')); }); }).catch(e => { console.error('Failed to init database:', e.message); process.exit(1); });
